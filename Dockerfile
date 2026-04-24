@@ -1,144 +1,77 @@
 # syntax=docker/dockerfile:1
 # check=error=true
 
-ARG RUBY_VERSION=4.0.1
-FROM ruby:${RUBY_VERSION}-slim-bookworm AS base
+# This Dockerfile is designed for production, not development. Use with Kamal or build'n'run by hand:
+# docker build -t action_cable_example .
+# docker run -d -p 80:80 -e RAILS_MASTER_KEY=<value from config/master.key> --name action_cable_example action_cable_example
 
+# For a containerized dev environment, see Dev Containers: https://guides.rubyonrails.org/getting_started_with_devcontainer.html
+
+# Make sure RUBY_VERSION matches the Ruby version in .ruby-version
+ARG RUBY_VERSION=4.0.1
+FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
+
+# Rails app lives here
 WORKDIR /rails
 
-# Install base packages for runtime
-# jemalloc: memory optimization
-# libvips: for Active Storage and image processing
-# postgresql-client: for database interaction
+# Install base packages
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y \
-    curl \
-    libjemalloc2 \
-    libvips \
-    postgresql-client \
-    tzdata \
-    && rm -rf /var/lib/apt/lists /var/cache/apt/archives
+    apt-get install --no-install-recommends -y curl libjemalloc2 libvips postgresql-client && \
+    ln -s /usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-# Set common environment variables
+# Set production environment variables and enable jemalloc for reduced memory usage and latency.
 ENV RAILS_ENV="production" \
     BUNDLE_DEPLOYMENT="1" \
     BUNDLE_PATH="/usr/local/bundle" \
     BUNDLE_WITHOUT="development" \
-    LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2" \
-    MALLOC_CONF="dirty_decay_ms:1000,narenas:2,background_thread:true"
+    LD_PRELOAD="/usr/local/lib/libjemalloc.so"
 
-# --- Build Stage (for Release) ---
+# Throw-away build stage to reduce size of final image
 FROM base AS build
 
 # Install packages needed to build gems
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y \
-    build-essential \
-    git \
-    libpq-dev \
-    libyaml-dev \
-    pkg-config
+    apt-get install --no-install-recommends -y build-essential git libpq-dev libvips libyaml-dev pkg-config && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
+# Install application gems
+COPY vendor/* ./vendor/
 COPY Gemfile Gemfile.lock ./
+
 RUN bundle install && \
     rm -rf ~/.bundle/ "${BUNDLE_PATH}"/ruby/*/cache "${BUNDLE_PATH}"/ruby/*/bundler/gems/*/.git && \
-    bundle exec bootsnap precompile --gemfile
+    # -j 1 disable parallel compilation to avoid a QEMU bug: https://github.com/rails/bootsnap/issues/495
+    bundle exec bootsnap precompile -j 1 --gemfile
 
+# Copy application code
 COPY . .
 
-RUN bundle exec bootsnap precompile app/ lib/
-RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile && \
-    rm -rf node_modules
+# Precompile bootsnap code for faster boot times.
+# -j 1 disable parallel compilation to avoid a QEMU bug: https://github.com/rails/bootsnap/issues/495
+RUN bundle exec bootsnap precompile -j 1 app/ lib/
+
+# Precompiling assets for production without requiring secret RAILS_MASTER_KEY
+RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
 
 
-# --- Devcontainer ---
-FROM base AS devcontainer
 
-ENV RAILS_ENV="development" \
-    BUNDLE_DEPLOYMENT="0" \
-    BUNDLE_WITHOUT="" \
-    PATH="/usr/local/bundle/bin:$PATH"
 
-# Install dev tools
-RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y \
-    build-essential \
-    git \
-    libpq-dev \
-    sudo \
-    zsh \
-    openssh-client \
-    imagemagick \
-    libyaml-dev \
-    && rm -rf /var/lib/apt/lists /var/cache/apt/archives
+# Final stage for app image
+FROM base
 
-ARG DEVELOPER_UID=1000
-ARG DEVELOPER_USERNAME=vscode
-
-RUN groupadd --gid ${DEVELOPER_UID} ${DEVELOPER_USERNAME} \
-    && useradd --uid ${DEVELOPER_UID} --gid ${DEVELOPER_UID} -m -s /bin/zsh ${DEVELOPER_USERNAME} \
-    && echo "${DEVELOPER_USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${DEVELOPER_USERNAME} \
-    && chmod 0440 /etc/sudoers.d/${DEVELOPER_USERNAME}
-
-USER ${DEVELOPER_USERNAME}
-# Install Oh My Zsh
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-
-RUN gem install rails
-# --- Tests ---
-FROM base AS tests
-
-ENV RAILS_ENV="test" \
-    BUNDLE_DEPLOYMENT="0" \
-    BUNDLE_WITHOUT=""
-
-# Install build dependencies + Chromium
-RUN apt-get update -qq && \
-    apt-get install -y \
-    build-essential \
-    git \
-    libpq-dev \
-    wget \
-    libyaml-dev \
-    pkg-config \
-    libgbm1 \
-    libu2f-udev \
-    fonts-liberation \
-    firefox-esr \
-    && rm -rf /var/lib/apt/lists /var/cache/apt/archives
-
-# Install geckodriver
-RUN wget https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz && \
-    tar -xzf geckodriver-v0.34.0-linux64.tar.gz && \
-    mv geckodriver /usr/local/bin/ && \
-    rm geckodriver-v0.34.0-linux64.tar.gz
-
-COPY Gemfile Gemfile.lock ./
-RUN bundle install
-
-COPY . .
-
-# Run as non-root user for Chrome to work properly
+# Run and own only the runtime files as a non-root user for security
 RUN groupadd --system --gid 1000 rails && \
-    useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash && \
-    chown -R rails:rails /rails
-
+    useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash
 USER 1000:1000
-
-# --- Release ---
-FROM base AS release
 
 # Copy built artifacts: gems, application
-COPY --from=build "${BUNDLE_PATH}" "${BUNDLE_PATH}"
-COPY --from=build /rails /rails
+COPY --chown=rails:rails --from=build "${BUNDLE_PATH}" "${BUNDLE_PATH}"
+COPY --chown=rails:rails --from=build /rails /rails
 
-# Run as non-root user
-RUN groupadd --system --gid 1000 rails && \
-    useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash && \
-    chown -R rails:rails db log storage tmp
-
-USER 1000:1000
-
+# Entrypoint prepares the database.
 ENTRYPOINT ["/rails/bin/docker-entrypoint"]
+
+# Start server via Thruster by default, this can be overwritten at runtime
 EXPOSE 80
-CMD ["./bin/thrust", "bundle", "exec", "puma", "-C", "config/puma.rb"]
+CMD ["./bin/thrust", "./bin/rails", "server"]
